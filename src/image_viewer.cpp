@@ -82,20 +82,28 @@ struct TargetState {  // состояние цели
 // режимы преследования
 enum class FollowMode { SEARCH, ALIGN, FOLLOW, STOP, LOST };
 
+
+
 class ImageViewer : public rclcpp::Node {
 public:
   ImageViewer() : Node("image_viewer") {
     rclcpp::QoS qos(rclcpp::KeepLast(20));
     qos.best_effort();
-    //qos.durability_volatile();
-    lidar_sub_.subscribe(this, LIDAR_TOPIC, qos.get_rmw_qos_profile());
+    camera_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+      CAMERA_TOPIC, qos,
+      std::bind(&ImageViewer::onImage, this, std::placeholders::_1));
+    lidar_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+      LIDAR_TOPIC, qos,
+      std::bind(&ImageViewer::onScan, this, std::placeholders::_1));
+    /*
+      lidar_sub_.subscribe(this, LIDAR_TOPIC, qos.get_rmw_qos_profile());
     camera_sub_.subscribe(this, CAMERA_TOPIC, qos.get_rmw_qos_profile());
     sync_ =
         std::make_shared<Synchronizer>(SyncPolicy(20), lidar_sub_, camera_sub_);
     sync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(2));
     sync_->registerCallback(std::bind(&ImageViewer::fusionCallback, this,
                                       std::placeholders::_1,
-                                      std::placeholders::_2));
+                                      std::placeholders::_2));*/
     cmd_pub_ =
         this->create_publisher<geometry_msgs::msg::Twist>(TWIST_TOPIC, 10);
 
@@ -111,18 +119,22 @@ public:
 
 private:
   size_t n_ = 0;
-  using SyncPolicy = message_filters::sync_policies::ApproximateTime<
-      sensor_msgs::msg::LaserScan, sensor_msgs::msg::Image>;
-  using Synchronizer = message_filters::Synchronizer<SyncPolicy>;
+  //using SyncPolicy = message_filters::sync_policies::ApproximateTime<
+  //    sensor_msgs::msg::LaserScan, sensor_msgs::msg::Image>;
+  //using Synchronizer = message_filters::Synchronizer<SyncPolicy>;
 
-  message_filters::Subscriber<sensor_msgs::msg::LaserScan> lidar_sub_;
-  message_filters::Subscriber<sensor_msgs::msg::Image> camera_sub_;
+  //message_filters::Subscriber<sensor_msgs::msg::LaserScan> lidar_sub_;
+  //message_filters::Subscriber<sensor_msgs::msg::Image> camera_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
-  std::shared_ptr<Synchronizer> sync_;
+  //std::shared_ptr<Synchronizer> sync_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr lidar_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr camera_sub_;
+  //sensor_msgs::msg::Image::ConstSharedPtr last_image_;
+  Detection last_detection;
+  rclcpp::Time last_image_stamp_{0, 0, RCL_ROS_TIME};
 
-  void
-  fusionCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr &lidar_msg,
+  void  fusionCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr &lidar_msg,
                  const sensor_msgs::msg::Image::ConstSharedPtr &camera_msg) {
     auto t0 = this->now();
     const double ts_scan = rclcpp::Time(lidar_msg->header.stamp).seconds();
@@ -135,8 +147,8 @@ private:
     
     RCLCPP_INFO(this->get_logger(), "onscan in");
     auto lidar_data = onScan(lidar_msg);
-    RCLCPP_INFO(this->get_logger(), "cb in");
-    auto camera_data = cb(camera_msg);
+    RCLCPP_INFO(this->get_logger(), "onImage in");
+    auto camera_data = onImage(camera_msg);
     RCLCPP_INFO(this->get_logger(), "processTogether in");
     processTogether(lidar_data, camera_data);
     auto dtf = (this->now() - t0).seconds();
@@ -160,7 +172,7 @@ private:
       cp.z = p.x + t[0];  // глубина вперёд
       converted.push_back(cp);
     }
-    RCLCPP_INFO(this->get_logger(), "processTogether in");
+    //RCLCPP_INFO(this->get_logger(), "processTogether in");
     RCLCPP_INFO(this->get_logger(), "check x %i, width %i", camera_data.bbox.x,
                 camera_data.bbox.width);
     float W = CAMERA_WIDTH;
@@ -210,11 +222,12 @@ private:
     // RCLCPP_INFO(this->get_logger(), "score in");
     TargetState state = score(result, true);
 
-    RCLCPP_INFO(this->get_logger(), "state %d", state.valid);
+    //RCLCPP_INFO(this->get_logger(), "state %d", state.valid);
     FollowMode mode = decide(state);
-     RCLCPP_INFO(this->get_logger(), "статус %d", (int)mode);
+    //RCLCPP_INFO(this->get_logger(), "статус %d", (int)mode);
     MotionCommand cmd = compute(state, mode);
-     RCLCPP_INFO(this->get_logger(), "поворот %f", cmd.angular);
+    RCLCPP_INFO(this->get_logger(), "поворот %f", cmd.angular);
+    RCLCPP_INFO(this->get_logger(), "линейная скорость %f", cmd.linear);
 #if CONTROL == true
     sendCommand(cmd);
 #endif
@@ -321,7 +334,7 @@ private:
 
   ////////////////////////////////////////////////////////////////
 
-  Detection cb(const sensor_msgs::msg::Image::ConstSharedPtr msg) {
+  Detection onImage(const sensor_msgs::msg::Image::ConstSharedPtr msg) {
     Detection defDetect;
     n_++;
     if (n_ % 30 == 0) {
@@ -366,7 +379,8 @@ private:
 #if QT == true
           cv::imshow("camera", bgr);
 #endif
-
+          last_detection = det;
+          last_image_stamp_ = rclcpp::Time(msg->header.stamp);
           return det;
         }
       } else {
@@ -376,7 +390,8 @@ private:
 #if QT == true
         cv::imshow("camera", cv_ptr->image);
 #endif
-
+        last_detection = defDetect;
+        last_image_stamp_ = rclcpp::Time(msg->header.stamp);
         return defDetect;
       }
 #if QT == true
@@ -479,7 +494,9 @@ private:
   onScan(const sensor_msgs::msg::LaserScan::ConstSharedPtr msg) {
     std::vector<LidarPoint> points;
     // Картинка 600x600, центр — робот
-
+    //if (!last_detection) {
+    //  return points;
+    //}
 #if QT == true
     const int W = 600, H = 600;
     cv::Mat img(H, W, CV_8UC3, cv::Scalar(15, 15, 15));
@@ -540,7 +557,17 @@ private:
     cv::imshow(win_, img);
     cv::waitKey(1);
 #endif
+    const auto scan_t = rclcpp::Time(msg->header.stamp);
+    const double dtscan = std::abs((scan_t - last_image_stamp_).seconds());
 
+    // допустимое окно подберите, например 0.15–0.30 c
+    if (dtscan > 0.25) {
+      return points;
+    }
+    auto t0 = this->now();
+    processTogether(points, last_detection);
+    auto dtf = (this->now() - t0).seconds();
+    RCLCPP_INFO(this->get_logger(), "processTogether took %.3f s", dtf);
     return points;
   }
 
