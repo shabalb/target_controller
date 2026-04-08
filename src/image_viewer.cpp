@@ -161,6 +161,9 @@ private:
   };
   void processTogether(std::vector<LidarPoint> lidar_data,
                        Detection camera_data) {
+    auto t0 = this->now();
+    
+    
     // перевести точки лидара в систему координат камеры
     float t[3] = {0, 0, 0.02};
     std::vector<convertPoint> converted, box;
@@ -235,6 +238,8 @@ private:
 
     // RCLCPP_INFO(this->get_logger(),
     //             "Получили синхронизированную пару и обработали её");
+    auto dtf = (this->now() - t0).seconds();
+    RCLCPP_INFO(this->get_logger(), "processTogether took %.3f s", dtf);
   }
 
   ///////////////////////// формирование команд
@@ -336,6 +341,7 @@ private:
 
   Detection onImage(const sensor_msgs::msg::Image::ConstSharedPtr msg) {
     Detection defDetect;
+    auto t0 = this->now();
     n_++;
     if (n_ % 30 == 0) {
       RCLCPP_INFO(get_logger(), "frames=%zu stamp=%u.%u encoding=%s", n_,
@@ -381,6 +387,8 @@ private:
 #endif
           last_detection = det;
           last_image_stamp_ = rclcpp::Time(msg->header.stamp);
+          auto dtf = (this->now() - t0).seconds();
+          RCLCPP_INFO(this->get_logger(), "onImage took %.3f s", dtf);
           return det;
         }
       } else {
@@ -392,6 +400,7 @@ private:
 #endif
         last_detection = defDetect;
         last_image_stamp_ = rclcpp::Time(msg->header.stamp);
+        
         return defDetect;
       }
 #if QT == true
@@ -564,10 +573,8 @@ private:
     if (dtscan > 0.25) {
       return points;
     }
-    auto t0 = this->now();
     processTogether(points, last_detection);
-    auto dtf = (this->now() - t0).seconds();
-    RCLCPP_INFO(this->get_logger(), "processTogether took %.3f s", dtf);
+
     return points;
   }
 
