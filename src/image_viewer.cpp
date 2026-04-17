@@ -29,9 +29,11 @@
 float CAMERA_WIDTH = 640;
 float CAMERA_FOV = 1.466;
 
+float ANGLE_SHIFT = 0;//M_PI;//0
+
 char const *LIDAR_TOPIC = "/scan";
-char const *CAMERA_TOPIC = "/camera/image";
-//char const *CAMERA_TOPIC = "/front_camera/image_raw";
+//char const *CAMERA_TOPIC = "/camera/image";
+char const *CAMERA_TOPIC = "/front_camera/image_raw";
 //char const *CAMERA_TOPIC = "/front_camera/image_raw/compressed";
 char const *TWIST_TOPIC = "/cmd_vel";
 
@@ -41,13 +43,17 @@ float ROTATE[3][3] = {{0, 0, 0.02}, {0, 0, 0.02}, {0, 0, 0.02}};
 float Kd = 0.8f; // по расстоянию
 float Ka = 1.5f; // по углу
 
-float max_linear = 0.5f; // скорость
-float max_angular = 0.35f;
+float max_linear = 0.3f; // скорость
+float max_angular = 0.1f;
 
-float desired_distance = 1.5f; // удерживаемое расстояние
-float dist_deadband = 0.10f;   // мертвая зона расстояния
-float angle_deadband = 0.05f;  // угла
+float desired_distance = 0.5f; // удерживаемое расстояние
+float dist_deadband = 0.20f;   // мертвая зона расстояния
+float angle_deadband = 0.3f;  // угла
 /////////////////
+
+//disabled filter delay time
+
+//////////////////////////////////
 
 struct Detection {
   bool found = false;
@@ -186,12 +192,28 @@ private:
     float u_left = camera_data.bbox.x;
     float u_right = camera_data.bbox.x + camera_data.bbox.width;
     // RCLCPP_INFO(this->get_logger(), "check 2");
+
+    //*
+    float theta_left  = atan2(u_left  - cx, fx);
+    float theta_right = atan2(u_right - cx, fx);
+
+    if (theta_left > theta_right) {
+        std::swap(theta_left, theta_right);
+    }//*/
+
+
+    RCLCPP_INFO(this->get_logger(), "theta_left %f, theta_right %f", theta_left, theta_right);
+
+    /*
     float theta_right = -atan2(u_left - cx, fx);
     float theta_left = -atan2(u_right - cx, fx);
     // RCLCPP_INFO(this->get_logger(), "check 3");
     if (theta_left > theta_right) {
       std::swap(theta_left, theta_right);
-    }
+    }//*/
+
+
+
     // RCLCPP_INFO(this->get_logger(), "check 4");
     /*
     if (!lidar_data.empty()){
@@ -219,13 +241,18 @@ private:
           dist = p.range;
           // mindistangle = p.angle;
         }
+        //if (p.x > 0.1) {
+        //    RCLCPP_INFO(this->get_logger(),
+        //        "lidar point: x=%.3f y=%.3f angle=%.3f",
+        //        p.x, p.y, p.angle);
+        //}
       }
     }
-    // RCLCPP_INFO(this->get_logger(), "минимальное расстояние %f", dist);
+    //RCLCPP_INFO(this->get_logger(), "минимальное расстояние %f", dist);
     // RCLCPP_INFO(this->get_logger(), "score in");
     TargetState state = score(result, true);
 
-    //RCLCPP_INFO(this->get_logger(), "state %d", state.valid);
+    RCLCPP_INFO(this->get_logger(), "TargetState: distance: %f, valid: %d", state.distance, state.valid);
     FollowMode mode = decide(state);
     //RCLCPP_INFO(this->get_logger(), "статус %d", (int)mode);
     MotionCommand cmd = compute(state, mode);
@@ -274,7 +301,8 @@ private:
     switch (mode) {
     case FollowMode::ALIGN:
       cmd.linear = 0.0f;
-      cmd.angular = std::clamp(Ka * angle_error, -max_angular, max_angular);
+      cmd.angular = -std::clamp(Ka * angle_error, -max_angular, max_angular);
+      RCLCPP_INFO(this->get_logger(), "ALIGN");
       break;
 
     case FollowMode::FOLLOW:
@@ -282,7 +310,7 @@ private:
         cmd.linear = std::clamp(Kd * dist_error, -max_linear, max_linear);
 
       if (std::fabs(angle_error) >= angle_deadband)
-        cmd.angular = std::clamp(Ka * angle_error, -max_angular, max_angular);
+        cmd.angular = -std::clamp(Ka * angle_error, -max_angular, max_angular);
       break;
 
     case FollowMode::STOP:
@@ -293,7 +321,8 @@ private:
     case FollowMode::SEARCH:
     case FollowMode::LOST:
       cmd.linear = 0.0f;
-      cmd.angular = 0.2f; // медленно крутиться искать цель
+      cmd.angular = 0.1f; 
+      RCLCPP_INFO(this->get_logger(), "LOST");
       break;
     }
 
@@ -305,6 +334,7 @@ private:
     TargetState state;
 
     if (!camera_found || object_points.empty()) {
+      RCLCPP_INFO(this->get_logger(), "object_points.empty(): %d", object_points.empty());
       state.valid = false;
       state.lost = true;
       return state;
@@ -391,6 +421,7 @@ private:
           RCLCPP_INFO(this->get_logger(), "onImage took %.3f s", dtf);
           return det;
         }
+
       } else {
 
         cv_ptr = cv_bridge::toCvShare(msg, msg->encoding);
@@ -415,22 +446,28 @@ private:
     }
     return defDetect;
   }
-
+/*
   Detection detectRedSquareAndCell(const cv::Mat &bgr, int grid_cols,
                                    int grid_rows) {
     Detection d;
-    if (bgr.empty())
+    if (bgr.empty()){
+      RCLCPP_INFO(this->get_logger(), "image is empty in detect");
       return d;
+    }
 
     cv::Mat hsv;
     cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
 
     // Красный: два диапазона Hue
     cv::Mat mask1, mask2, mask;
-    cv::inRange(hsv, cv::Scalar(0, 80, 80), cv::Scalar(10, 255, 255), mask1);
-    cv::inRange(hsv, cv::Scalar(170, 80, 80), cv::Scalar(180, 255, 255), mask2);
+    cv::inRange(hsv, cv::Scalar(0, 50, 50), cv::Scalar(20, 255, 255), mask1);
+    cv::inRange(hsv, cv::Scalar(160, 50, 50), cv::Scalar(180, 255, 255), mask2);
     mask = mask1 | mask2;
-
+    #if QT == true
+    //cv::imshow("mask1", mask1);
+    //cv::imshow("mask2", mask2);
+    cv::imshow("mask", mask);
+    #endif
     // Убираем шум
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
     cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
@@ -439,14 +476,22 @@ private:
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(mask, contours, cv::RETR_EXTERNAL,
                      cv::CHAIN_APPROX_SIMPLE);
-
+    
+    cv::Mat contour_vis = bgr.clone();
+    cv::drawContours(contour_vis, contours, -1, cv::Scalar(0, 255, 0), 2);
+    #if QT == true
+    cv::imshow("contours", contour_vis);
+    #endif
+    
     double bestScore = 0.0;
     cv::Rect bestRect;
     std::vector<cv::Point> bestApprox;
     double maxAspect = 0.;
     for (const auto &c : contours) {
       double area = cv::contourArea(c);
+      //RCLCPP_INFO(this->get_logger(), "aspect from detect %.3f", aspect);
       if (area < 400.0)
+
         continue; // фильтр по площади (подстрой)
 
       cv::Rect r = cv::boundingRect(c);
@@ -454,20 +499,26 @@ private:
       if (aspect > maxAspect) {
         maxAspect = aspect;
       }
-      if (aspect < 0.5 || aspect > 1.5)
+      RCLCPP_INFO(this->get_logger(), "aspect from detect %.3f area: %f", aspect, area);
+      if (aspect < 0.5 || aspect > 2.6)
+
         continue; // близко к квадрату
 
       // Аппроксимация контура -> квадрат обычно даёт 4 вершины
-      //*
+      
       std::vector<cv::Point> approx;
       double peri = cv::arcLength(c, true);
       cv::approxPolyDP(c, approx, 0.02 * peri, true);
-      if ((int)approx.size() >= 8)
+      if ((int)approx.size() >= 8){
+        RCLCPP_INFO(this->get_logger(), "больше 8 вершин");
         continue;
-      if (!cv::isContourConvex(approx)) // выпуклость
+      }
+      if (!cv::isContourConvex(approx)){ // выпуклость
+        RCLCPP_INFO(this->get_logger(), "не выпуклый контур");
         continue;
-      //*/
-      // Скор: площадь * “квадратность”
+      }
+      
+      
       double fill = area / (double)(r.area() + 1);
       double score = area * fill;
 
@@ -478,8 +529,10 @@ private:
       }
     }
     this->maxAspect = maxAspect;
-    // if (bestScore <= 0.0)
-    //   return d;
+    if (bestScore <= 0.0){
+      RCLCPP_INFO(this->get_logger(), "bestScore <=0");
+      return d;
+    }
 
     d.found = true;
     d.bbox = bestRect;
@@ -497,6 +550,114 @@ private:
     d.cell_y = std::clamp((int)(d.center.y / cellH), 0, grid_rows - 1);
 
     return d;
+  }*/
+
+  Detection detectRedSquareAndCell(const cv::Mat &bgr, int grid_cols,
+                                   int grid_rows) {
+    Detection d;
+    if (bgr.empty()){
+      std::cout<< "image is empty in detect"<<std::endl;
+      return d;
+    }
+    cv::Mat blurred;
+    cv::GaussianBlur(bgr, blurred, cv::Size(27, 27), 0);
+    cv::Mat hsv;
+    cv::cvtColor(blurred, hsv, cv::COLOR_BGR2HSV);
+
+    // Красный: два диапазона Hue
+    cv::Mat mask1, mask2, mask;
+    cv::inRange(hsv, cv::Scalar(0, 50, 50), cv::Scalar(10, 255, 255), mask1);
+    cv::inRange(hsv, cv::Scalar(170, 50, 50), cv::Scalar(180, 255, 255), mask2);
+    mask = mask1 | mask2;
+    #if QT == true
+    //cv::imshow("mask1", mask1);
+    //cv::imshow("mask2", mask2);
+    cv::imshow("mask", mask);
+    #endif
+    // Убираем шум
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL,
+                     cv::CHAIN_APPROX_SIMPLE);
+    
+    cv::Mat contour_vis = bgr.clone();
+    cv::drawContours(contour_vis, contours, -1, cv::Scalar(0, 255, 0), 2);
+
+    #if QT == true
+    cv::imshow("contours", contour_vis);
+    #endif
+    
+    double bestScore = 0.0;
+    cv::Rect bestRect;
+    std::vector<cv::Point> bestApprox;
+    double maxAspect = 0.;
+    for (const auto &c : contours) {
+      double area = cv::contourArea(c);
+      //RCLCPP_INFO(this->get_logger(), "aspect from detect %.3f", aspect);
+      if (area < 400.0){
+
+        continue; // фильтр по площади (подстрой)
+      }
+      cv::Rect r = cv::boundingRect(c);
+      double aspect = (double)r.width / (double)r.height;
+      if (aspect > maxAspect) {
+        maxAspect = aspect;
+      }
+      std::cout<< "aspect from detect"<<aspect<<" area:"<< area<<std::endl;
+      if (aspect < 0.5 || aspect > 2.6){
+
+        continue; // близко к квадрату
+      }
+      // Аппроксимация контура -> квадрат обычно даёт 4 вершины
+      //*
+      std::vector<cv::Point> approx;
+      double peri = cv::arcLength(c, true);
+      cv::approxPolyDP(c, approx, 0.02 * peri, true);
+      if ((int)approx.size() >= 15){
+        std::cout<< "больше 15 вершин"<<std::endl;
+        continue;
+      }
+      /*
+      if (!cv::isContourConvex(approx)){ // выпуклость
+        std::cout<< "не выпуклый контур"<<std::endl;
+        continue;
+      }*/
+      //*/
+      
+      double fill = area / (double)(r.area() + 1);
+      double score = area * fill;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestRect = r;
+        bestApprox = approx;
+      }
+    }
+    
+    if (bestScore <= 0.0){
+      std::cout<< "bestScore <=0"<<std::endl;
+      return d;
+    }
+
+    d.found = true;
+    d.bbox = bestRect;
+    d.center = cv::Point2f(bestRect.x + bestRect.width * 0.5f,
+                           bestRect.y + bestRect.height * 0.5f);
+
+    // Определяем “клетку” сетки grid_cols x grid_rows
+    const int W = bgr.cols;
+    const int H = bgr.rows;
+
+    int cellW = std::max(1, W / grid_cols);
+    int cellH = std::max(1, H / grid_rows);
+    
+    d.cell_x = std::clamp((int)(d.center.x / cellW), 0, grid_cols - 1);
+    d.cell_y = std::clamp((int)(d.center.y / cellH), 0, grid_rows - 1);
+    std::cout<< "detected "<<d.cell_x<<" "<<d.cell_y<<std::endl;
+    return d;
   }
 
   std::vector<LidarPoint>
@@ -506,6 +667,7 @@ private:
     //if (!last_detection) {
     //  return points;
     //}
+    const float angle_shift = ANGLE_SHIFT;
 #if QT == true
     const int W = 600, H = 600;
     cv::Mat img(H, W, CV_8UC3, cv::Scalar(15, 15, 15));
@@ -524,7 +686,7 @@ private:
     poly.reserve(msg->ranges.size());
     points.reserve(msg->ranges.size());
 
-    float angle = msg->angle_min;
+    float angle = msg->angle_min + angle_shift;
     for (size_t i = 0; i < msg->ranges.size();
          ++i, angle += msg->angle_increment) {
       float r = msg->ranges[i];
@@ -568,11 +730,15 @@ private:
 #endif
     const auto scan_t = rclcpp::Time(msg->header.stamp);
     const double dtscan = std::abs((scan_t - last_image_stamp_).seconds());
-
+    RCLCPP_INFO(this->get_logger(), "dtscan %.3f s", dtscan);
     // допустимое окно подберите, например 0.15–0.30 c
-    if (dtscan > 0.25) {
+    
+    /*
+    if (dtscan > 3) {
+      //RCLCPP_INFO(this->get_logger(), "dtscan %.3f s", dtscan);
       return points;
-    }
+    }*/
+    RCLCPP_INFO(this->get_logger(), "processTogether in");
     processTogether(points, last_detection);
 
     return points;
