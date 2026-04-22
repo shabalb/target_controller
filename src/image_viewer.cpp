@@ -112,6 +112,7 @@ public:
                                       std::placeholders::_2));*/
     cmd_pub_ =
         this->create_publisher<geometry_msgs::msg::Twist>(TWIST_TOPIC, 10);
+    cmd_vel_raw = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel_raw", 10);
 
 #if QT == true
     cv::namedWindow("camera", cv::WINDOW_NORMAL);
@@ -132,6 +133,7 @@ private:
   //message_filters::Subscriber<sensor_msgs::msg::LaserScan> lidar_sub_;
   //message_filters::Subscriber<sensor_msgs::msg::Image> camera_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_raw; 
   rclcpp::TimerBase::SharedPtr timer_;
   //std::shared_ptr<Synchronizer> sync_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr lidar_sub_;
@@ -364,7 +366,8 @@ private:
     geometry_msgs::msg::Twist msg;
     msg.linear.x = cmd.linear;
     msg.angular.z = cmd.angular;
-    cmd_pub_->publish(msg);
+    //cmd_pub_->publish(msg);
+    cmd_vel_raw->publish(msg);
   }
 
   ////////////////////////////////////////////////////////////////

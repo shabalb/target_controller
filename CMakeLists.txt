@@ -29,9 +29,11 @@ endif()
 add_executable(move_target src/move_target.cpp)
 add_executable(drive_robot src/drive_robot.cpp)
 add_executable(image_viewer src/image_viewer.cpp)
+add_executable(motion_validator src/motion_validator.cpp)
 ament_target_dependencies(move_target rclcpp )
 ament_target_dependencies(drive_robot rclcpp geometry_msgs)
 ament_target_dependencies(image_viewer rclcpp sensor_msgs cv_bridge message_filters geometry_msgs)
+ament_target_dependencies(motion_validator rclcpp sensor_msgs geometry_msgs)
 
 include_directories(${OpenCV_INCLUDE_DIRS})
 
@@ -55,6 +57,9 @@ install(TARGETS drive_robot
 )
 
 install(TARGETS image_viewer
+  DESTINATION lib/${PROJECT_NAME})
+
+install(TARGETS motion_validator
   DESTINATION lib/${PROJECT_NAME})
 
 
