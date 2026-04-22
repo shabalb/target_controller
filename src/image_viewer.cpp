@@ -46,9 +46,9 @@ float Ka = 1.5f; // по углу
 float max_linear = 0.3f; // скорость
 float max_angular = 0.1f;
 
-float desired_distance = 0.5f; // удерживаемое расстояние
-float dist_deadband = 0.20f;   // мертвая зона расстояния
-float angle_deadband = 0.3f;  // угла
+float desired_distance = 0.7f; // удерживаемое расстояние
+float dist_deadband = 0.25f;   // мертвая зона расстояния
+float angle_deadband = 0.4f;  // угла
 /////////////////
 
 //disabled filter delay time
@@ -321,7 +321,7 @@ private:
     case FollowMode::SEARCH:
     case FollowMode::LOST:
       cmd.linear = 0.0f;
-      cmd.angular = 0.1f; 
+      cmd.angular = 0.07f; 
       RCLCPP_INFO(this->get_logger(), "LOST");
       break;
     }
@@ -733,11 +733,17 @@ private:
     RCLCPP_INFO(this->get_logger(), "dtscan %.3f s", dtscan);
     // допустимое окно подберите, например 0.15–0.30 c
     
-    /*
+    //*
     if (dtscan > 3) {
       //RCLCPP_INFO(this->get_logger(), "dtscan %.3f s", dtscan);
+      TargetState tmp;
+      MotionCommand cmd = compute(tmp, FollowMode::LOST);
+    
+#if CONTROL == true
+    sendCommand(cmd);
+#endif
       return points;
-    }*/
+    }//*/
     RCLCPP_INFO(this->get_logger(), "processTogether in");
     processTogether(points, last_detection);
 
