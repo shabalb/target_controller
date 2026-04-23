@@ -2,17 +2,15 @@
 #include <opencv2/core/types.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
-#include <sensor_msgs/msg/laser_scan.hpp>
-
-#include <message_filters/subscriber.h>
-#include <message_filters/sync_policies/approximate_time.h>
-#include <message_filters/synchronizer.h>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 
 #include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/opencv.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 
@@ -21,24 +19,16 @@
 //#include "structs.cpp"
 
 #define QT false
-#define CONTROL false
+#define CONTROL true
 
 ////////////////// параметры
 //float CAMERA_WIDTH = 640;
 //float CAMERA_FOV = 1.047;
 float CAMERA_WIDTH = 640;
 float CAMERA_FOV = 1.466;
-
-float ANGLE_SHIFT = M_PI;//0
-
-char const *LIDAR_TOPIC = "/scan";
-//char const *CAMERA_TOPIC = "/camera/image";
-char const *CAMERA_TOPIC = "/front_camera/image_raw";
-//char const *CAMERA_TOPIC = "/front_camera/image_raw/compressed";
+char const *CAMERA_TOPIC = "/oak/rgb/image_raw";
+char const *POINT_CLOUD_TOPIC = "/oak/stereo/points";
 char const *TWIST_TOPIC = "/cmd_vel";
-
-float SHIFT[3] = {0, 0, 0.02};
-float ROTATE[3][3] = {{0, 0, 0.02}, {0, 0, 0.02}, {0, 0, 0.02}};
 
 float Kd = 0.8f; // по расстоянию
 float Ka = 1.5f; // по углу
@@ -63,13 +53,13 @@ struct Detection {
   int cell_y = -1;
 };
 
-//*
-struct LidarPoint { //  в системе лидара
+struct CloudPoint {
   float x = 0.0f;
   float y = 0.0f;
+  float z = 0.0f;
   float range = 0.0f;
   float angle = 0.0f;
-};//*/
+};
 
 struct MotionCommand {
   float linear = 0.0f;  // линейная скорость
@@ -98,18 +88,9 @@ public:
     camera_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
       CAMERA_TOPIC, qos,
       std::bind(&ImageViewer::onImage, this, std::placeholders::_1));
-    lidar_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-      LIDAR_TOPIC, qos,
-      std::bind(&ImageViewer::onScan, this, std::placeholders::_1));
-    /*
-      lidar_sub_.subscribe(this, LIDAR_TOPIC, qos.get_rmw_qos_profile());
-    camera_sub_.subscribe(this, CAMERA_TOPIC, qos.get_rmw_qos_profile());
-    sync_ =
-        std::make_shared<Synchronizer>(SyncPolicy(20), lidar_sub_, camera_sub_);
-    sync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(2));
-    sync_->registerCallback(std::bind(&ImageViewer::fusionCallback, this,
-                                      std::placeholders::_1,
-                                      std::placeholders::_2));*/
+    cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      POINT_CLOUD_TOPIC, qos,
+      std::bind(&ImageViewer::onPointCloud, this, std::placeholders::_1));
     cmd_pub_ =
         this->create_publisher<geometry_msgs::msg::Twist>(TWIST_TOPIC, 10);
     cmd_vel_raw = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel_raw", 10);
@@ -119,140 +100,43 @@ public:
     cv::namedWindow(win_, cv::WINDOW_AUTOSIZE);
 #endif
 
-    RCLCPP_INFO(get_logger(), "Subscribed to: %s", CAMERA_TOPIC);
+    RCLCPP_INFO(get_logger(), "Subscribed camera: %s", CAMERA_TOPIC);
+    RCLCPP_INFO(get_logger(), "Subscribed cloud: %s", POINT_CLOUD_TOPIC);
   }
 
   ~ImageViewer() override { cv::destroyAllWindows(); }
 
 private:
   size_t n_ = 0;
-  //using SyncPolicy = message_filters::sync_policies::ApproximateTime<
-  //    sensor_msgs::msg::LaserScan, sensor_msgs::msg::Image>;
-  //using Synchronizer = message_filters::Synchronizer<SyncPolicy>;
-
-  //message_filters::Subscriber<sensor_msgs::msg::LaserScan> lidar_sub_;
-  //message_filters::Subscriber<sensor_msgs::msg::Image> camera_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_raw; 
   rclcpp::TimerBase::SharedPtr timer_;
-  //std::shared_ptr<Synchronizer> sync_;
-  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr lidar_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr camera_sub_;
   //sensor_msgs::msg::Image::ConstSharedPtr last_image_;
   Detection last_detection;
   rclcpp::Time last_image_stamp_{0, 0, RCL_ROS_TIME};
+  int image_width_ = 640;
+  int image_height_ = 480;
 
-  void  fusionCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr &lidar_msg,
-                 const sensor_msgs::msg::Image::ConstSharedPtr &camera_msg) {
-    auto t0 = this->now();
-    const double ts_scan = rclcpp::Time(lidar_msg->header.stamp).seconds();
-    const double ts_img  = rclcpp::Time(camera_msg->header.stamp).seconds();
-    const double dt = std::abs(ts_scan - ts_img);
-
-    RCLCPP_INFO(this->get_logger(),
-              "scan=%.6f image=%.6f dt=%.3f",
-              ts_scan, ts_img, dt);
-    
-    RCLCPP_INFO(this->get_logger(), "onscan in");
-    auto lidar_data = onScan(lidar_msg);
-    RCLCPP_INFO(this->get_logger(), "onImage in");
-    auto camera_data = onImage(camera_msg);
-    RCLCPP_INFO(this->get_logger(), "processTogether in");
-    processTogether(lidar_data, camera_data);
-    auto dtf = (this->now() - t0).seconds();
-    RCLCPP_INFO(this->get_logger(), "fusionCallback took %.3f s", dtf);
+  float median(std::vector<float> &values) const {
+    if (values.empty()) {
+      return 0.0f;
+    }
+    const size_t mid = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + mid, values.end());
+    float med = values[mid];
+    if (values.size() % 2 == 0) {
+      const auto max_it = std::max_element(values.begin(), values.begin() + mid);
+      med = 0.5f * (med + *max_it);
+    }
+    return med;
   }
-  struct convertPoint { //  в системе лидара
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-  };
-  void processTogether(std::vector<LidarPoint> lidar_data,
-                       Detection camera_data) {
+
+  void processTogether(const std::vector<CloudPoint> &object_points,
+                       const Detection &camera_data) {
     auto t0 = this->now();
-    
-    
-    // перевести точки лидара в систему координат камеры
-    float t[3] = {0, 0, 0.02};
-    std::vector<convertPoint> converted, box;
-    converted.reserve(lidar_data.size());
-    for (const auto &p : lidar_data) {
-      convertPoint cp;
-      cp.x = -p.y + t[1]; // вправо в камере
-      cp.y = 0.0f + t[2]; // высота, грубое допущение
-      cp.z = p.x + t[0];  // глубина вперёд
-      converted.push_back(cp);
-    }
-    //RCLCPP_INFO(this->get_logger(), "processTogether in");
-    RCLCPP_INFO(this->get_logger(), "check x %i, width %i", camera_data.bbox.x,
-                camera_data.bbox.width);
-    float W = CAMERA_WIDTH;
-    float FOV = CAMERA_FOV;
-    float fx = W / (2.0f * tan(FOV / 2.0f));
-    float cx = W / 2.0f;
-    // RCLCPP_INFO(this->get_logger(), "check 1");
-    float u_left = camera_data.bbox.x;
-    float u_right = camera_data.bbox.x + camera_data.bbox.width;
-    // RCLCPP_INFO(this->get_logger(), "check 2");
-
-    //*
-    float theta_left  = atan2(u_left  - cx, fx);
-    float theta_right = atan2(u_right - cx, fx);
-
-    if (theta_left > theta_right) {
-        std::swap(theta_left, theta_right);
-    }//*/
-
-
-    RCLCPP_INFO(this->get_logger(), "theta_left %f, theta_right %f", theta_left, theta_right);
-
-    /*
-    float theta_right = -atan2(u_left - cx, fx);
-    float theta_left = -atan2(u_right - cx, fx);
-    // RCLCPP_INFO(this->get_logger(), "check 3");
-    if (theta_left > theta_right) {
-      std::swap(theta_left, theta_right);
-    }//*/
-
-
-
-    // RCLCPP_INFO(this->get_logger(), "check 4");
-    /*
-    if (!lidar_data.empty()){
-      RCLCPP_INFO(this->get_logger(), "theta_left %f, lidarPoints %f",
-    theta_left, lidar_data[0].angle); }else{ RCLCPP_INFO(this->get_logger(),
-    "lidar_data is empty");
-    }*/
-
-    std::vector<LidarPoint> result;
-    // RCLCPP_INFO(this->get_logger(), "select in");
-    for (const auto &p : lidar_data) {
-      float angle = p.angle; // возможно + offset
-
-      if (angle >= theta_left && angle <= theta_right) {
-        result.push_back(p);
-      }
-    }
-    // RCLCPP_INFO(this->get_logger(), "cmd form in");
-    if (!result.empty()) { // в result точки объекта. Далее нужно перенести в
-                           // функцию
-      float dist = result[0].range;
-      // float mindistangle;
-      for (const auto &p : result) {
-        if (p.range < dist) {
-          dist = p.range;
-          // mindistangle = p.angle;
-        }
-        //if (p.x > 0.1) {
-        //    RCLCPP_INFO(this->get_logger(),
-        //        "lidar point: x=%.3f y=%.3f angle=%.3f",
-        //        p.x, p.y, p.angle);
-        //}
-      }
-    }
-    //RCLCPP_INFO(this->get_logger(), "минимальное расстояние %f", dist);
-    // RCLCPP_INFO(this->get_logger(), "score in");
-    TargetState state = score(result, true);
+    TargetState state = score(object_points, camera_data.found);
 
     RCLCPP_INFO(this->get_logger(), "TargetState: distance: %f, valid: %d", state.distance, state.valid);
     FollowMode mode = decide(state);
@@ -331,7 +215,7 @@ private:
     return cmd;
   }
 
-  TargetState score(const std::vector<LidarPoint> &object_points,
+  TargetState score(const std::vector<CloudPoint> &object_points,
                     bool camera_found) {
     TargetState state;
 
@@ -345,19 +229,28 @@ private:
     state.valid = true;
     state.lost = false;
 
-    // можно взять ближайшую точку
-    float min_range = object_points.front().range;
-    float best_angle = object_points.front().angle;
+    std::vector<float> depth_values;
+    std::vector<float> angle_values;
+    depth_values.reserve(object_points.size());
+    angle_values.reserve(object_points.size());
 
     for (const auto &p : object_points) {
-      if (p.range < min_range) {
-        min_range = p.range;
-        best_angle = p.angle;
-      }
+      if (!std::isfinite(p.z) || !std::isfinite(p.angle))
+        continue;
+      if (p.z < 0.1f || p.z > 20.0f)
+        continue;
+      depth_values.push_back(p.z);
+      angle_values.push_back(p.angle);
     }
 
-    state.distance = min_range;
-    state.angle = best_angle;
+    if (depth_values.empty()) {
+      state.valid = false;
+      state.lost = true;
+      return state;
+    }
+
+    state.distance = median(depth_values);
+    state.angle = median(angle_values);
 
     return state;
   }
@@ -389,6 +282,8 @@ private:
         cv_ptr = cv_bridge::toCvShare(msg, "rgb8");
         cv::Mat bgr;
         cv::cvtColor(cv_ptr->image, bgr, cv::COLOR_RGB2BGR);
+        image_width_ = bgr.cols;
+        image_height_ = bgr.rows;
 
         // cv::imshow("camera", bgr);
 
@@ -418,20 +313,18 @@ private:
 #if QT == true
           cv::imshow("camera", bgr);
 #endif
+          last_detection = det;
+          last_image_stamp_ = rclcpp::Time(msg->header.stamp);
           auto dtf = (this->now() - t0).seconds();
           RCLCPP_INFO(this->get_logger(), "onImage took %.3f s", dtf);
+          return det;
         }
-
-        // Важно обновлять stamp каждого кадра, даже если цель не найдена.
-        // Иначе dtscan растет от старого "удачного" кадра и onScan может
-        // начать постоянно выходить через if (dtscan > 3).
-        last_detection = det;
-        last_image_stamp_ = rclcpp::Time(msg->header.stamp);
-        return det;
 
       } else {
 
         cv_ptr = cv_bridge::toCvShare(msg, msg->encoding);
+        image_width_ = cv_ptr->image.cols;
+        image_height_ = cv_ptr->image.rows;
 
 #if QT == true
         cv::imshow("camera", cv_ptr->image);
@@ -563,7 +456,7 @@ private:
                                    int grid_rows) {
     Detection d;
     if (bgr.empty()){
-      //std::cout<< "image is empty in detect"<<std::endl;
+      std::cout<< "image is empty in detect"<<std::endl;
       return d;
     }
     cv::Mat blurred;
@@ -613,7 +506,7 @@ private:
       if (aspect > maxAspect) {
         maxAspect = aspect;
       }
-      //std::cout<< "aspect from detect"<<aspect<<" area:"<< area<<std::endl;
+      std::cout<< "aspect from detect"<<aspect<<" area:"<< area<<std::endl;
       if (aspect < 0.5 || aspect > 2.6){
 
         continue; // близко к квадрату
@@ -624,7 +517,7 @@ private:
       double peri = cv::arcLength(c, true);
       cv::approxPolyDP(c, approx, 0.02 * peri, true);
       if ((int)approx.size() >= 15){
-        //std::cout<< "больше 15 вершин"<<std::endl;
+        std::cout<< "больше 15 вершин"<<std::endl;
         continue;
       }
       /*
@@ -645,7 +538,7 @@ private:
     }
     
     if (bestScore <= 0.0){
-      //std::cout<< "bestScore <=0"<<std::endl;
+      std::cout<< "bestScore <=0"<<std::endl;
       return d;
     }
 
@@ -663,103 +556,97 @@ private:
     
     d.cell_x = std::clamp((int)(d.center.x / cellW), 0, grid_cols - 1);
     d.cell_y = std::clamp((int)(d.center.y / cellH), 0, grid_rows - 1);
-    //std::cout<< "detected "<<d.cell_x<<" "<<d.cell_y<<std::endl;
+    std::cout<< "detected "<<d.cell_x<<" "<<d.cell_y<<std::endl;
     return d;
   }
 
-  std::vector<LidarPoint>
-  onScan(const sensor_msgs::msg::LaserScan::ConstSharedPtr msg) {
-    std::vector<LidarPoint> points;
-    // Картинка 600x600, центр — робот
-    //if (!last_detection) {
-    //  return points;
-    //}
-    const float angle_shift = ANGLE_SHIFT;
-#if QT == true
-    const int W = 600, H = 600;
-    cv::Mat img(H, W, CV_8UC3, cv::Scalar(15, 15, 15));
+  std::vector<CloudPoint>
+  onPointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+    std::vector<CloudPoint> points;
+    const auto cloud_t = rclcpp::Time(msg->header.stamp);
+    const double dt_cloud = std::abs((cloud_t - last_image_stamp_).seconds());
 
-    const cv::Point center(W / 2, H / 2);
-    // Масштаб: сколько пикселей на метр (подстрой под range_max)
-    const float meters_span = 12.0f; // “радиус” в метрах, который хотим видеть
-    const float px_per_m = (std::min(W, H) * 0.45f) / meters_span;
-
-    // сетка (опционально)
-    drawGrid(img, center, px_per_m);
-#endif
-
-    // Собираем точки контура
-    std::vector<cv::Point> poly;
-    poly.reserve(msg->ranges.size());
-    points.reserve(msg->ranges.size());
-
-    float angle = msg->angle_min + angle_shift;
-    for (size_t i = 0; i < msg->ranges.size();
-         ++i, angle += msg->angle_increment) {
-      float r = msg->ranges[i];
-      if (!std::isfinite(r))
-        continue;
-      if (r < msg->range_min || r > msg->range_max)
-        continue;
-
-      float x = r * std::cos(angle);
-      float y = r * std::sin(angle);
-
-#if QT == true
-      // экранные координаты: +x вправо, +y вверх (поэтому y инвертируем)
-      int u = static_cast<int>(center.x + x * px_per_m);
-      int v = static_cast<int>(center.y - y * px_per_m);
-
-      // отсекаем, если за пределами
-      if (u < 0 || u >= W || v < 0 || v >= H)
-        continue;
-
-      poly.emplace_back(u, v);
-#endif
-
-      points.push_back({x, y, r, angle});
-    }
-#if QT == true
-    // Рисуем контур: полилиния + точки
-    if (poly.size() >= 2) {
-      cv::polylines(img, poly, false, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
-    }
-    for (const auto &p : poly) {
-      cv::circle(img, p, 1, cv::Scalar(0, 200, 255), -1, cv::LINE_AA);
-    }
-
-    // Робот в центре
-    cv::circle(img, center, 4, cv::Scalar(255, 255, 255), -1, cv::LINE_AA);
-
-    // Показ + обновление
-    cv::imshow(win_, img);
-    cv::waitKey(1);
-#endif
-    const auto scan_t = rclcpp::Time(msg->header.stamp);
-    const double dtscan = std::abs((scan_t - last_image_stamp_).seconds());
-    RCLCPP_INFO(this->get_logger(), "dtscan %.3f s", dtscan);
-    // допустимое окно подберите, например 0.15–0.30 c
-    
-    //*
-    if (dtscan > 3) {
-      //RCLCPP_INFO(this->get_logger(), "dtscan %.3f s", dtscan);
+    if (dt_cloud > 3.0 || !last_detection.found) {
       TargetState tmp;
       MotionCommand cmd = compute(tmp, FollowMode::LOST);
-    
 #if CONTROL == true
-    sendCommand(cmd);
+      sendCommand(cmd);
 #endif
       return points;
-    }//*/
-    RCLCPP_INFO(this->get_logger(), "processTogether in");
-    processTogether(points, last_detection);
+    }
 
+    const int src_w = std::max(1, image_width_);
+    const int src_h = std::max(1, image_height_);
+    const int cloud_w = static_cast<int>(msg->width);
+    const int cloud_h = static_cast<int>(msg->height);
+    const bool organized = cloud_w > 0 && cloud_h > 1;
+
+    float fx = CAMERA_WIDTH / (2.0f * std::tan(CAMERA_FOV / 2.0f));
+    float cx = CAMERA_WIDTH / 2.0f;
+    float u_left = static_cast<float>(last_detection.bbox.x);
+    float u_right = static_cast<float>(last_detection.bbox.x + last_detection.bbox.width);
+    float theta_left = std::atan2(u_left - cx, fx);
+    float theta_right = std::atan2(u_right - cx, fx);
+    if (theta_left > theta_right) {
+      std::swap(theta_left, theta_right);
+    }
+
+    cv::Rect roi;
+    if (organized) {
+      const float sx = static_cast<float>(cloud_w) / static_cast<float>(src_w);
+      const float sy = static_cast<float>(cloud_h) / static_cast<float>(src_h);
+      roi.x = std::clamp(static_cast<int>(last_detection.bbox.x * sx), 0, cloud_w - 1);
+      roi.y = std::clamp(static_cast<int>(last_detection.bbox.y * sy), 0, cloud_h - 1);
+      roi.width = std::clamp(static_cast<int>(last_detection.bbox.width * sx), 1, cloud_w - roi.x);
+      roi.height = std::clamp(static_cast<int>(last_detection.bbox.height * sy), 1, cloud_h - roi.y);
+    }
+
+    try {
+      sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
+      size_t idx = 0;
+      points.reserve(5000);
+
+      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z, ++idx) {
+        const float x = *iter_x;
+        const float y = *iter_y;
+        const float z = *iter_z;
+
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+          continue;
+        if (z <= 0.05f)
+          continue;
+
+        if (organized) {
+          const int u = static_cast<int>(idx % static_cast<size_t>(cloud_w));
+          const int v = static_cast<int>(idx / static_cast<size_t>(cloud_w));
+          if (u < roi.x || u >= roi.x + roi.width || v < roi.y || v >= roi.y + roi.height)
+            continue;
+        } else {
+          const float angle = std::atan2(x, z);
+          if (angle < theta_left || angle > theta_right)
+            continue;
+        }
+
+        CloudPoint p;
+        p.x = x;
+        p.y = y;
+        p.z = z;
+        p.range = std::sqrt(x * x + y * y + z * z);
+        p.angle = std::atan2(x, z);
+        points.push_back(p);
+      }
+    } catch (const std::runtime_error &e) {
+      RCLCPP_ERROR(this->get_logger(), "PointCloud2 parse error: %s", e.what());
+      return points;
+    }
+
+    processTogether(points, last_detection);
     return points;
   }
 
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_;
-  std::string win_ = "Lidar 2D (contour)";
-  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  std::string win_ = "PointCloud ROI";
   double maxAspect = 0.;
 };
 

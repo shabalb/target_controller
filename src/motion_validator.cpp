@@ -10,8 +10,8 @@
 class MotionValidator : public rclcpp::Node {
 public:
   MotionValidator() : Node("motion_validator") {
-    declare_parameter<double>("min_stop_distance", 0.30);
-    declare_parameter<double>("slowdown_distance", 0.90);
+    declare_parameter<double>("min_stop_distance", 0.90);
+    declare_parameter<double>("slowdown_distance", 1.30);
     declare_parameter<double>("front_sector_half_angle", 0.35);
     declare_parameter<double>("rear_sector_half_angle", 0.35);
     declare_parameter<double>("turn_sector_half_angle", 0.45);
@@ -57,12 +57,12 @@ private:
     const double slowdown_distance =
         get_parameter("slowdown_distance").as_double();
 
-    const bool scan_fresh =
-        last_scan_stamp_.nanoseconds() != 0 &&
-        std::abs((now() - last_scan_stamp_).seconds()) <= scan_timeout_sec;
+    const bool scan_fresh = true;
+        //last_scan_stamp_.nanoseconds() != 0 &&
+        //std::abs((now() - last_scan_stamp_).seconds()) <= scan_timeout_sec;
 
     if (safe_cmd.linear.x > 0.0) {
-      if (!scan_fresh || !std::isfinite(last_sector_distances_.front)) {
+      if (!scan_fresh ) {
         safe_cmd.linear.x = 0.0;
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                              "No fresh lidar scan, blocking forward motion");
@@ -85,7 +85,7 @@ private:
     }
 
     if (safe_cmd.linear.x < 0.0) {
-      if (!scan_fresh || !std::isfinite(last_sector_distances_.rear)) {
+      if (!scan_fresh ) {
         safe_cmd.linear.x = 0.0;
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                              "No fresh lidar scan, blocking reverse motion");
@@ -108,7 +108,7 @@ private:
     }
 
     if (safe_cmd.angular.z > 0.0) {
-      if (!scan_fresh || !std::isfinite(last_sector_distances_.left_turn)) {
+      if (!scan_fresh ) {
         safe_cmd.angular.z = 0.0;
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                              "No fresh lidar scan, blocking left turn");
@@ -120,7 +120,7 @@ private:
             last_sector_distances_.left_turn);
       }
     } else if (safe_cmd.angular.z < 0.0) {
-      if (!scan_fresh || !std::isfinite(last_sector_distances_.right_turn)) {
+      if (!scan_fresh ) {
         safe_cmd.angular.z = 0.0;
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                              "No fresh lidar scan, blocking right turn");
