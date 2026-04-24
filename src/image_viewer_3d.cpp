@@ -40,7 +40,8 @@ float max_angular = 0.1f;
 
 float desired_distance = 0.7f; // удерживаемое расстояние
 float dist_deadband = 0.25f;   // мертвая зона расстояния
-float angle_deadband = 0.4f;  // угла
+float angle_align_deadband = 0.05f;   // грубое центрирование (~3 градуса)
+float angle_follow_deadband = 0.02f;  // мелкая подстройка при движении
 /////////////////
 
 //disabled filter delay time
@@ -124,8 +125,10 @@ private:
   //sensor_msgs::msg::Image::ConstSharedPtr last_image_;
   Detection last_detection;
   rclcpp::Time last_image_stamp_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_detection_stamp_{0, 0, RCL_ROS_TIME};
   int image_width_ = 640;
   int image_height_ = 480;
+  double detection_hold_sec_ = 0.6;
 
   float median(std::vector<float> &values) const {
     if (values.empty()) {
@@ -172,9 +175,11 @@ private:
   void processTogether(const std::vector<CloudPoint> &object_points,
                        const Detection &camera_data) {
     auto t0 = this->now();
-    TargetState state = score(object_points, camera_data.found);
+    TargetState state = score(object_points, camera_data);
 
-    RCLCPP_INFO(this->get_logger(), "TargetState: distance: %f, valid: %d", state.distance, state.valid);
+    RCLCPP_INFO(this->get_logger(),
+                "TargetState: distance: %f, angle: %f, valid: %d",
+                state.distance, state.angle, state.valid);
     FollowMode mode = decide(state);
     //RCLCPP_INFO(this->get_logger(), "статус %d", (int)mode);
     MotionCommand cmd = compute(state, mode);
@@ -197,12 +202,13 @@ private:
     if (!target.valid)
       return FollowMode::LOST;
 
-    if (std::fabs(target.angle) > angle_deadband)
+    if (std::fabs(target.angle) > angle_align_deadband)
       return FollowMode::ALIGN;
 
     float dist_error = target.distance - desired_distance;
 
-    if (std::fabs(dist_error) < dist_deadband)
+    if (std::fabs(dist_error) < dist_deadband &&
+        std::fabs(target.angle) < angle_follow_deadband)
       return FollowMode::STOP;
 
     return FollowMode::FOLLOW;
@@ -231,7 +237,7 @@ private:
       if (std::fabs(dist_error) >= dist_deadband)
         cmd.linear = std::clamp(Kd * dist_error, -max_linear, max_linear);
 
-      if (std::fabs(angle_error) >= angle_deadband)
+      if (std::fabs(angle_error) >= angle_follow_deadband)
         cmd.angular = -std::clamp(Ka * angle_error, -max_angular, max_angular);
       break;
 
@@ -252,11 +258,13 @@ private:
   }
 
   TargetState score(const std::vector<CloudPoint> &object_points,
-                    bool camera_found) {
+                    const Detection &camera_data) {
     TargetState state;
 
-    if (!camera_found || object_points.empty()) {
-      RCLCPP_INFO(this->get_logger(), "object_points.empty(): %d", object_points.empty());
+    if (!camera_data.found || object_points.empty()) {
+      RCLCPP_INFO(this->get_logger(),
+                  "score invalid: camera_found=%d object_points.empty()=%d",
+                  camera_data.found, object_points.empty());
       state.valid = false;
       state.lost = true;
       return state;
@@ -266,17 +274,14 @@ private:
     state.lost = false;
 
     std::vector<float> depth_values;
-    std::vector<float> angle_values;
     depth_values.reserve(object_points.size());
-    angle_values.reserve(object_points.size());
 
     for (const auto &p : object_points) {
-      if (!std::isfinite(p.z) || !std::isfinite(p.angle))
+      if (!std::isfinite(p.range))
         continue;
-      if (p.z < 0.1f || p.z > 20.0f)
+      if (p.range < 0.1f || p.range > 20.0f)
         continue;
-      depth_values.push_back(p.z);
-      angle_values.push_back(p.angle);
+      depth_values.push_back(p.range);
     }
 
     if (depth_values.empty()) {
@@ -286,7 +291,20 @@ private:
     }
 
     state.distance = median(depth_values);
-    state.angle = median(angle_values);
+
+    // Use the RGB detection center for heading control. This keeps the target
+    // centered in the camera frame even if the depth cloud is slightly shifted
+    // relative to the color image.
+    const float image_cx = 0.5f * static_cast<float>(image_width_);
+    const float fx_pixels =
+        static_cast<float>(image_width_) /
+        (2.0f * std::tan(CAMERA_FOV / 2.0f));
+    const float pixel_offset = camera_data.center.x - image_cx;
+    state.angle = std::atan2(pixel_offset, fx_pixels);
+
+    RCLCPP_INFO(this->get_logger(),
+                "score: depth_samples=%zu pixel_offset=%f angle=%f",
+                depth_values.size(), pixel_offset, state.angle);
 
     return state;
   }
@@ -349,8 +367,13 @@ private:
                              det.center.x, det.center.y, det.cell_x,
                              det.cell_y);
         last_detection = det;
+        last_detection_stamp_ = rclcpp::Time(msg->header.stamp);
       } else {
-        last_detection = defDetect;
+        const rclcpp::Time image_t(msg->header.stamp);
+        const double age = std::abs((image_t - last_detection_stamp_).seconds());
+        if (age > detection_hold_sec_) {
+          last_detection = defDetect;
+        }
       }
 
 #if QT == true
@@ -454,7 +477,7 @@ private:
         maxAspect = aspect;
       }
       std::cout<< "aspect from detect"<<aspect<<" area:"<< area<<std::endl;
-      if (aspect < 0.5 || aspect > 2.6){
+      if (aspect < 0.15 || aspect > 3.0){
 
         continue; // близко к квадрату
       }
@@ -512,8 +535,10 @@ private:
     std::vector<CloudPoint> points;
     const auto cloud_t = rclcpp::Time(msg->header.stamp);
     const double dt_cloud = std::abs((cloud_t - last_image_stamp_).seconds());
+    const double det_age = std::abs((cloud_t - last_detection_stamp_).seconds());
+    const bool detection_fresh = last_detection.found && det_age <= detection_hold_sec_;
 
-    if (dt_cloud > 3.0 || !last_detection.found) {
+    if (dt_cloud > 3.0 || !detection_fresh) {
       TargetState tmp;
       MotionCommand cmd = compute(tmp, FollowMode::LOST);
 #if CONTROL == true
@@ -562,7 +587,8 @@ private:
 
         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
           continue;
-        if (z <= 0.05f)
+        const float range = std::sqrt(x * x + y * y + z * z);
+        if (!std::isfinite(range) || range <= 0.05f || range > 20.0f)
           continue;
 
         if (organized) {
@@ -580,7 +606,7 @@ private:
         p.x = x;
         p.y = y;
         p.z = z;
-        p.range = std::sqrt(x * x + y * y + z * z);
+        p.range = range;
         p.angle = std::atan2(x, z);
         points.push_back(p);
       }
