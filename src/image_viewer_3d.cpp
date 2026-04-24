@@ -2,6 +2,7 @@
 #include <opencv2/core/types.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
@@ -18,7 +19,7 @@
 #include "visualize.cpp"
 //#include "structs.cpp"
 
-#define QT false
+#define QT true
 #define CONTROL true
 
 ////////////////// параметры
@@ -26,7 +27,8 @@
 //float CAMERA_FOV = 1.047;
 float CAMERA_WIDTH = 640;
 float CAMERA_FOV = 1.466;
-char const *CAMERA_TOPIC = "/oak/rgb/image_raw";
+char const *CAMERA_TOPIC = "/camera/image";
+char const *DEPTH_TOPIC = "/oak/stereo/depth";
 char const *POINT_CLOUD_TOPIC = "/oak/stereo/points";
 char const *TWIST_TOPIC = "/cmd_vel";
 
@@ -88,6 +90,9 @@ public:
     camera_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
       CAMERA_TOPIC, qos,
       std::bind(&ImageViewer::onImage, this, std::placeholders::_1));
+    depth_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+      DEPTH_TOPIC, qos,
+      std::bind(&ImageViewer::onDepthImage, this, std::placeholders::_1));
     cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       POINT_CLOUD_TOPIC, qos,
       std::bind(&ImageViewer::onPointCloud, this, std::placeholders::_1));
@@ -97,10 +102,12 @@ public:
 
 #if QT == true
     cv::namedWindow("camera", cv::WINDOW_NORMAL);
+    cv::namedWindow("depth", cv::WINDOW_NORMAL);
     cv::namedWindow(win_, cv::WINDOW_AUTOSIZE);
 #endif
 
     RCLCPP_INFO(get_logger(), "Subscribed camera: %s", CAMERA_TOPIC);
+    RCLCPP_INFO(get_logger(), "Subscribed depth: %s", DEPTH_TOPIC);
     RCLCPP_INFO(get_logger(), "Subscribed cloud: %s", POINT_CLOUD_TOPIC);
   }
 
@@ -111,6 +118,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_raw; 
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr camera_sub_;
   //sensor_msgs::msg::Image::ConstSharedPtr last_image_;
@@ -131,6 +139,34 @@ private:
       med = 0.5f * (med + *max_it);
     }
     return med;
+  }
+
+  void showDepthDebug(const cv::Mat &depth_meters) {
+#if QT == true
+    if (depth_meters.empty()) {
+      return;
+    }
+    cv::Mat finite_mask = (depth_meters > 0.05f) & (depth_meters < 20.0f);
+    double min_v = 0.0;
+    double max_v = 0.0;
+    cv::minMaxLoc(depth_meters, &min_v, &max_v, nullptr, nullptr, finite_mask);
+    if (max_v <= min_v) {
+      max_v = min_v + 1.0;
+    }
+
+    cv::Mat normalized(depth_meters.size(), CV_8UC1, cv::Scalar(0));
+    depth_meters.convertTo(normalized, CV_8UC1, 255.0 / (max_v - min_v),
+                           -min_v * 255.0 / (max_v - min_v));
+    normalized.setTo(0, ~finite_mask);
+
+    cv::Mat depth_color;
+    cv::applyColorMap(normalized, depth_color, cv::COLORMAP_TURBO);
+    cv::putText(depth_color, "depth (m)",
+                cv::Point(10, 24), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                cv::Scalar(255, 255, 255), 2);
+    cv::imshow("depth", depth_color);
+    cv::waitKey(1);
+#endif
   }
 
   void processTogether(const std::vector<CloudPoint> &object_points,
@@ -276,67 +312,58 @@ private:
     }
     try {
 
-      cv_bridge::CvImageConstPtr cv_ptr;
-
-      if (msg->encoding == "rgb8") {
-        cv_ptr = cv_bridge::toCvShare(msg, "rgb8");
-        cv::Mat bgr;
+      cv::Mat bgr;
+      if (msg->encoding == sensor_msgs::image_encodings::RGB8 ||
+          msg->encoding == "rgb8") {
+        auto cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::RGB8);
         cv::cvtColor(cv_ptr->image, bgr, cv::COLOR_RGB2BGR);
-        image_width_ = bgr.cols;
-        image_height_ = bgr.rows;
-
-        // cv::imshow("camera", bgr);
-
-        // ищем квадрат и клетку (например, сетка 8x6)
-        auto det = detectRedSquareAndCell(bgr, 30, 30);
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500, "maxAspect %.1f",
-                             this->maxAspect);
-        if (det.found) {
-          cv::rectangle(bgr, det.bbox, cv::Scalar(0, 255, 0), 2);
-          cv::circle(bgr, det.center, 3, cv::Scalar(255, 255, 255), -1);
-
-          // подпись
-          std::string txt = "cell=(" + std::to_string(det.cell_x) + "," +
-                            std::to_string(det.cell_y) + ")";
-          cv::putText(bgr, txt,
-                      cv::Point(det.bbox.x, std::max(0, det.bbox.y - 8)),
-                      cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
-
-          // чтобы не спамить лог
-          RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-                               "Red square at px=(%.1f,%.1f) cell=(%d,%d)",
-                               det.center.x, det.center.y, det.cell_x,
-                               det.cell_y);
-
-          cv::rectangle(bgr, det.bbox, cv::Scalar(0, 255, 0), 2);
-
-#if QT == true
-          cv::imshow("camera", bgr);
-#endif
-          last_detection = det;
-          last_image_stamp_ = rclcpp::Time(msg->header.stamp);
-          auto dtf = (this->now() - t0).seconds();
-          RCLCPP_INFO(this->get_logger(), "onImage took %.3f s", dtf);
-          return det;
-        }
-
+      } else if (msg->encoding == sensor_msgs::image_encodings::BGR8 ||
+                 msg->encoding == "bgr8") {
+        auto cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+        bgr = cv_ptr->image.clone();
+      } else if (msg->encoding == sensor_msgs::image_encodings::MONO8 ||
+                 msg->encoding == "mono8") {
+        auto cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::MONO8);
+        cv::cvtColor(cv_ptr->image, bgr, cv::COLOR_GRAY2BGR);
       } else {
-
-        cv_ptr = cv_bridge::toCvShare(msg, msg->encoding);
-        image_width_ = cv_ptr->image.cols;
-        image_height_ = cv_ptr->image.rows;
-
-#if QT == true
-        cv::imshow("camera", cv_ptr->image);
-#endif
-        last_detection = defDetect;
-        last_image_stamp_ = rclcpp::Time(msg->header.stamp);
-        
-        return defDetect;
+        auto cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+        bgr = cv_ptr->image.clone();
       }
+
+      image_width_ = bgr.cols;
+      image_height_ = bgr.rows;
+
+      auto det = detectRedSquareAndCell(bgr, 30, 30);
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500, "maxAspect %.1f",
+                           this->maxAspect);
+      if (det.found) {
+        cv::rectangle(bgr, det.bbox, cv::Scalar(0, 255, 0), 2);
+        cv::circle(bgr, det.center, 3, cv::Scalar(255, 255, 255), -1);
+        std::string txt = "cell=(" + std::to_string(det.cell_x) + "," +
+                          std::to_string(det.cell_y) + ")";
+        cv::putText(bgr, txt,
+                    cv::Point(det.bbox.x, std::max(0, det.bbox.y - 8)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+                             "Red square at px=(%.1f,%.1f) cell=(%d,%d)",
+                             det.center.x, det.center.y, det.cell_x,
+                             det.cell_y);
+        last_detection = det;
+      } else {
+        last_detection = defDetect;
+      }
+
 #if QT == true
+      cv::putText(bgr, std::string("rgb: ") + CAMERA_TOPIC,
+                  cv::Point(10, 24), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                  cv::Scalar(0, 255, 255), 2);
+      cv::imshow("camera", bgr);
       cv::waitKey(1);
 #endif
+      last_image_stamp_ = rclcpp::Time(msg->header.stamp);
+      auto dtf = (this->now() - t0).seconds();
+      RCLCPP_INFO(this->get_logger(), "onImage took %.3f s", dtf);
+      return last_detection;
     } catch (const cv_bridge::Exception &e) {
       RCLCPP_ERROR(get_logger(), "cv_bridge exception: %s", e.what());
       return defDetect;
@@ -346,111 +373,31 @@ private:
     }
     return defDetect;
   }
-/*
-  Detection detectRedSquareAndCell(const cv::Mat &bgr, int grid_cols,
-                                   int grid_rows) {
-    Detection d;
-    if (bgr.empty()){
-      RCLCPP_INFO(this->get_logger(), "image is empty in detect");
-      return d;
+
+  void onDepthImage(const sensor_msgs::msg::Image::ConstSharedPtr msg) {
+    try {
+      cv::Mat depth_meters;
+      if (msg->encoding == sensor_msgs::image_encodings::TYPE_32FC1 ||
+          msg->encoding == "32FC1") {
+        auto cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::TYPE_32FC1);
+        depth_meters = cv_ptr->image;
+      } else if (msg->encoding == sensor_msgs::image_encodings::TYPE_16UC1 ||
+                 msg->encoding == "16UC1") {
+        auto cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::TYPE_16UC1);
+        cv_ptr->image.convertTo(depth_meters, CV_32FC1, 0.001);
+      } else {
+        auto cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::MONO8);
+        cv_ptr->image.convertTo(depth_meters, CV_32FC1, 1.0 / 255.0);
+      }
+      showDepthDebug(depth_meters);
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Depth frame: %ux%u encoding=%s",
+                           msg->width, msg->height, msg->encoding.c_str());
+    } catch (const cv_bridge::Exception &e) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+                            "depth cv_bridge exception: %s", e.what());
     }
-
-    cv::Mat hsv;
-    cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
-
-    // Красный: два диапазона Hue
-    cv::Mat mask1, mask2, mask;
-    cv::inRange(hsv, cv::Scalar(0, 50, 50), cv::Scalar(20, 255, 255), mask1);
-    cv::inRange(hsv, cv::Scalar(160, 50, 50), cv::Scalar(180, 255, 255), mask2);
-    mask = mask1 | mask2;
-    #if QT == true
-    //cv::imshow("mask1", mask1);
-    //cv::imshow("mask2", mask2);
-    cv::imshow("mask", mask);
-    #endif
-    // Убираем шум
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
-    cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
-    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
-
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(mask, contours, cv::RETR_EXTERNAL,
-                     cv::CHAIN_APPROX_SIMPLE);
-    
-    cv::Mat contour_vis = bgr.clone();
-    cv::drawContours(contour_vis, contours, -1, cv::Scalar(0, 255, 0), 2);
-    #if QT == true
-    cv::imshow("contours", contour_vis);
-    #endif
-    
-    double bestScore = 0.0;
-    cv::Rect bestRect;
-    std::vector<cv::Point> bestApprox;
-    double maxAspect = 0.;
-    for (const auto &c : contours) {
-      double area = cv::contourArea(c);
-      //RCLCPP_INFO(this->get_logger(), "aspect from detect %.3f", aspect);
-      if (area < 400.0)
-
-        continue; // фильтр по площади (подстрой)
-
-      cv::Rect r = cv::boundingRect(c);
-      double aspect = (double)r.width / (double)r.height;
-      if (aspect > maxAspect) {
-        maxAspect = aspect;
-      }
-      RCLCPP_INFO(this->get_logger(), "aspect from detect %.3f area: %f", aspect, area);
-      if (aspect < 0.5 || aspect > 2.6)
-
-        continue; // близко к квадрату
-
-      // Аппроксимация контура -> квадрат обычно даёт 4 вершины
-      
-      std::vector<cv::Point> approx;
-      double peri = cv::arcLength(c, true);
-      cv::approxPolyDP(c, approx, 0.02 * peri, true);
-      if ((int)approx.size() >= 8){
-        RCLCPP_INFO(this->get_logger(), "больше 8 вершин");
-        continue;
-      }
-      if (!cv::isContourConvex(approx)){ // выпуклость
-        RCLCPP_INFO(this->get_logger(), "не выпуклый контур");
-        continue;
-      }
-      
-      
-      double fill = area / (double)(r.area() + 1);
-      double score = area * fill;
-
-      if (score > bestScore) {
-        bestScore = score;
-        bestRect = r;
-        bestApprox = approx;
-      }
-    }
-    this->maxAspect = maxAspect;
-    if (bestScore <= 0.0){
-      RCLCPP_INFO(this->get_logger(), "bestScore <=0");
-      return d;
-    }
-
-    d.found = true;
-    d.bbox = bestRect;
-    d.center = cv::Point2f(bestRect.x + bestRect.width * 0.5f,
-                           bestRect.y + bestRect.height * 0.5f);
-
-    // Определяем “клетку” сетки grid_cols x grid_rows
-    const int W = bgr.cols;
-    const int H = bgr.rows;
-
-    int cellW = std::max(1, W / grid_cols);
-    int cellH = std::max(1, H / grid_rows);
-
-    d.cell_x = std::clamp((int)(d.center.x / cellW), 0, grid_cols - 1);
-    d.cell_y = std::clamp((int)(d.center.y / cellH), 0, grid_rows - 1);
-
-    return d;
-  }*/
+  }
 
   Detection detectRedSquareAndCell(const cv::Mat &bgr, int grid_cols,
                                    int grid_rows) {
